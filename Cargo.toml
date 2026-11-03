@@ -1,0 +1,19 @@
+[workspace]
+resolver = "3"
+members = ["app"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+repository = "https://github.com/polterware/vitals"
+
+[workspace.dependencies]
+gpui = { version = "0.2.2", features = ["runtime_shaders", "font-kit"] }
+# A sibling checkout replaces it through the workspace's .cargo/config.toml [patch].
+polterware-ui = { git = "https://github.com/polterware/ui" }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+panic = "abort"
