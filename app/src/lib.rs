@@ -1,10 +1,16 @@
-//! Vitals in GPUI: live metrics of the hosts you reach over SSH, read from the vitals-agent.
+//! Vitals in GPUI: live metrics of the hosts you reach over SSH, read from the vitals-agent,
+//! or from a shell script where the agent cannot run.
 
 pub mod app;
 pub mod format;
 pub mod installer;
+pub mod parsers;
 pub mod protocol;
+pub mod script;
+pub mod secrets;
 pub mod session;
+pub mod settings;
+pub mod shell;
 pub mod shots;
 pub mod ssh;
 pub mod state;
@@ -15,10 +21,14 @@ use app::{Quit, register_key_bindings};
 use gpui::{App, AppContext as _, Application, Menu, MenuItem, px, size};
 use polterware_ui::icons::IconAssets;
 use polterware_ui::theme::{self, Theme};
-use polterware_ui::window::vibrancy;
+use polterware_ui::window::{dock_icon, vibrancy};
 
 /// The design system's root size in the desktop apps.
 const REM: f32 = 13.0;
+
+/// The Dock icon of a build run without its bundle: the Default export of `resources/vitals.icon`
+/// (`vitals Exports`) on the macOS icon grid. The bundle compiles `vitals.icon` itself.
+const DOCK_ICON: &[u8] = include_bytes!("../resources/vitals-icon.png");
 
 /// Opens the Vitals window and runs the app until it quits.
 pub fn run() {
@@ -26,6 +36,7 @@ pub fn run() {
         .with_assets(IconAssets)
         .run(|cx: &mut App| {
             cx.activate(true);
+            dock_icon::install_unbundled(DOCK_ICON);
             theme::set_root_rem(REM);
             cx.set_global(Theme::dark());
             polterware_ui::init(cx);

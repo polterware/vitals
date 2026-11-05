@@ -1,10 +1,11 @@
 //! What Vitals keeps on this computer, in the files the Electron app wrote and reads:
-//! `servers.json` (saved hosts) and `known_hosts.json` (approved host keys, by
-//! `host:port`), both in `~/Library/Application Support/Vitals` unless `VITALS_DATA_DIR`
+//! `servers.json` (saved hosts), `known_hosts.json` (approved host keys, by `host:port`), and
+//! `settings.json` ([`crate::settings`]), all in `~/Library/Application Support/Vitals` unless `VITALS_DATA_DIR`
 //! names another folder.
 //!
-//! Saved secrets stay out of reach: the Electron app sealed them with its own safe storage
-//! (`secretEnc`), which this app neither reads nor writes, so a password is asked for again.
+//! No secret is written here: saved passwords and passphrases go to the macOS Keychain
+//! ([`crate::secrets`]). The Electron app sealed its own with its safe storage (`secretEnc`),
+//! which this app neither reads nor writes, only keeps.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -16,6 +17,15 @@ pub fn data_dir() -> PathBuf {
     if let Some(dir) = std::env::var_os("VITALS_DATA_DIR") {
         return PathBuf::from(dir);
     }
+    // Unit tests never reach the real folder.
+    if cfg!(test) {
+        return std::env::temp_dir().join(format!("vitals-test-data-{}", std::process::id()));
+    }
+    default_data_dir()
+}
+
+/// `~/Library/Application Support/Vitals`, where the Electron app kept its files too.
+pub fn default_data_dir() -> PathBuf {
     let home = std::env::var_os("HOME")
         .map(PathBuf::from)
         .unwrap_or_default();
@@ -110,6 +120,16 @@ impl Store {
             .unwrap_or_default()
     }
 
+    /// The saved hosts, none when `servers.json` is missing, and `None` when it is there but
+    /// cannot be read, so a caller never takes a broken file for an empty list.
+    pub fn servers_checked(&self) -> Option<Vec<Server>> {
+        let path = self.servers_path();
+        if !path.exists() {
+            return Some(Vec::new());
+        }
+        read_json::<ServerFile>(&path).map(|file| file.servers)
+    }
+
     /// Saves `server` over the one with its id, or the one for the same `user@host:port`,
     /// or as a new one; returns its id.
     pub fn upsert_server(&self, mut server: Server) -> std::io::Result<String> {
@@ -168,6 +188,23 @@ impl Store {
             },
         );
         write_json(&self.known_hosts_path(), &hosts)
+    }
+
+    /// The approved host keys: `host:port` and its fingerprint, by host.
+    pub fn known_host_list(&self) -> Vec<(String, String)> {
+        self.known_hosts()
+            .into_iter()
+            .map(|(key, known)| (key, known.fingerprint))
+            .collect()
+    }
+
+    /// Forgets the key of `key` (`host:port`), so the next connection asks for it again.
+    pub fn remove_known_host(&self, key: &str) -> std::io::Result<()> {
+        let mut hosts = self.known_hosts();
+        if hosts.remove(key).is_some() {
+            write_json(&self.known_hosts_path(), &hosts)?;
+        }
+        Ok(())
     }
 }
 
@@ -309,6 +346,15 @@ mod tests {
         assert_eq!(
             store.verify_host_key("h", 2222, "SHA256:x="),
             HostKeyVerdict::Known
+        );
+        assert_eq!(
+            store.known_host_list(),
+            vec![("h:2222".to_string(), "SHA256:x=".to_string())]
+        );
+        store.remove_known_host("h:2222").unwrap();
+        assert_eq!(
+            store.verify_host_key("h", 2222, "SHA256:x="),
+            HostKeyVerdict::New
         );
         let _ = fs::remove_dir_all(store.dir());
     }

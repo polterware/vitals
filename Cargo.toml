@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["app"]
+members = ["agent", "app"]
 
 [workspace.package]
 version = "0.1.0"
@@ -17,3 +17,10 @@ polterware-ui = { git = "https://github.com/polterware/ui" }
 lto = "thin"
 codegen-units = 1
 panic = "abort"
+
+# The agent goes over SSH to every host: built for size (`cargo build --profile agent`).
+[profile.agent]
+inherits = "release"
+opt-level = "s"
+lto = "fat"
+strip = true

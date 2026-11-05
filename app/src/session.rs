@@ -1,23 +1,33 @@
 //! A host's live session, run on the background runtime: connect, approve the host key,
 //! install the agent, read its frames, and restart the stream or the connection when either
-//! drops, as the Electron app's `AgentSession` and `SessionManager` do.
+//! drops, as the Electron app's `AgentSession` and `SessionManager` do. Where the agent cannot
+//! be installed or never starts, the session falls back to the remote script
+//! ([`crate::script`]) for good, as the Electron app's `SshSession` does: its samples become
+//! the same snapshots.
 //!
 //! The view talks to it through [`SessionHandle`] and hears back through [`SessionEvent`]s.
+//! The Terminal tab's shell ([`crate::shell`]) runs beside it on the same connection, which
+//! the session hands over each time it signs in.
 
-use std::sync::OnceLock;
-use std::time::Duration;
+use std::sync::{Arc, OnceLock};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use futures::channel::mpsc as events;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 
 use crate::installer;
+use crate::parsers::{self, DeltaState, FrameBuffer};
 use crate::protocol::{self, Command, Frame, Hello, LineBuffer, Signal, Snapshot};
+use crate::script;
+use crate::shell::{self, ShellCommand, ShellEvent};
 use crate::ssh::{ConnectError, Connection, Target};
 use crate::store::Store;
 
 const INITIAL_BACKOFF: Duration = Duration::from_secs(1);
 const MAX_BACKOFF: Duration = Duration::from_secs(10);
 const FAILURES_BEFORE_ERROR: u32 = 3;
+/// How long the script fallback waits before it starts a stopped script again.
+const SCRIPT_RESTART: Duration = Duration::from_secs(2);
 
 /// The runtime SSH runs on, apart from GPUI's executor.
 pub fn runtime() -> &'static tokio::runtime::Runtime {
@@ -68,6 +78,9 @@ pub enum SessionEvent {
     Status(Status, Option<String>),
     HostKey(String),
     Hello(Hello),
+    /// The agent could not be installed or run, so the metrics come from the remote script
+    /// from now on: why.
+    Fallback(String),
     Metrics(Box<Snapshot>),
     KillResult {
         id: String,
@@ -109,6 +122,7 @@ impl Default for Reconnect {
 #[derive(Clone)]
 pub struct SessionHandle {
     commands: mpsc::UnboundedSender<SessionCommand>,
+    shell: mpsc::UnboundedSender<ShellCommand>,
 }
 
 impl SessionHandle {
@@ -127,15 +141,46 @@ impl SessionHandle {
     pub fn disconnect(&self) {
         let _ = self.commands.send(SessionCommand::Disconnect);
     }
+
+    /// Opens the shell at `cols` × `rows` once the session is signed in.
+    pub fn open_shell(&self, cols: u16, rows: u16) {
+        let _ = self.shell.send(ShellCommand::Open { cols, rows });
+    }
+
+    pub fn shell_input(&self, bytes: Vec<u8>) {
+        let _ = self.shell.send(ShellCommand::Input(bytes));
+    }
+
+    pub fn resize_shell(&self, cols: u16, rows: u16) {
+        let _ = self.shell.send(ShellCommand::Resize { cols, rows });
+    }
+
+    pub fn close_shell(&self) {
+        let _ = self.shell.send(ShellCommand::Close);
+    }
+
+    /// A handle whose commands go nowhere, for tests that feed a session's events by hand.
+    #[cfg(test)]
+    pub fn detached() -> Self {
+        let (commands, _) = mpsc::unbounded_channel();
+        let (shell, _) = mpsc::unbounded_channel();
+        Self { commands, shell }
+    }
 }
 
-pub fn start(
-    target: Target,
-    store: Store,
-    reconnect: Reconnect,
-) -> (SessionHandle, events::UnboundedReceiver<SessionEvent>) {
+/// What a started session reports: its own events, and its shell's.
+pub struct SessionEvents {
+    pub session: events::UnboundedReceiver<SessionEvent>,
+    pub shell: events::Receiver<ShellEvent>,
+}
+
+pub fn start(target: Target, store: Store, reconnect: Reconnect) -> (SessionHandle, SessionEvents) {
     let (commands, command_rx) = mpsc::unbounded_channel();
     let (event_tx, event_rx) = events::unbounded();
+    let (shell, shell_rx) = mpsc::unbounded_channel();
+    let (shell_tx, shell_events) = events::channel(shell::IN_FLIGHT);
+    let (published, connections) = watch::channel(None);
+    runtime().spawn(shell::run(shell_rx, connections, shell_tx));
     runtime().spawn(async move {
         let mut session = Session {
             target,
@@ -143,11 +188,18 @@ pub fn start(
             reconnect,
             commands: command_rx,
             events: event_tx,
+            published,
         };
         session.run().await;
         session.emit(SessionEvent::Ended);
     });
-    (SessionHandle { commands }, event_rx)
+    (
+        SessionHandle { commands, shell },
+        SessionEvents {
+            session: event_rx,
+            shell: shell_events,
+        },
+    )
 }
 
 struct Session {
@@ -156,11 +208,13 @@ struct Session {
     reconnect: Reconnect,
     commands: mpsc::UnboundedReceiver<SessionCommand>,
     events: events::UnboundedSender<SessionEvent>,
+    /// The signed-in connection, for the shell.
+    published: watch::Sender<Option<Arc<Connection>>>,
 }
 
 enum StreamEnd {
     Disconnect,
-    /// The agent never sent its hello.
+    /// The metrics never started: the agent sent no hello, or the host cannot run the script.
     FailedStart(String),
     /// The connection dropped.
     Lost(String),
@@ -175,9 +229,17 @@ impl Session {
         self.emit(SessionEvent::Status(status, message.map(str::to_string)));
     }
 
+    /// Takes the connection back from the shell and closes it.
+    async fn close(&self, connection: &Connection) {
+        self.published.send_replace(None);
+        connection.close().await;
+    }
+
     async fn run(&mut self) {
         let mut approved: Option<String> = None;
         let mut ever_connected = false;
+        // Why the agent is unavailable, once the session fell back to the script.
+        let mut fallback: Option<String> = None;
         loop {
             self.status(
                 if ever_connected {
@@ -196,7 +258,7 @@ impl Session {
                 }
             };
             let connection = match opened {
-                Ok(connection) => connection,
+                Ok(connection) => Arc::new(connection),
                 Err(ConnectError::NewHostKey(print)) => {
                     self.emit(SessionEvent::HostKey(print.clone()));
                     self.status(Status::Connecting, Some("Waiting for host key approval"));
@@ -233,50 +295,42 @@ impl Session {
                 }
             };
 
-            self.status(Status::Connecting, Some("Installing metrics agent…"));
-            let installed = tokio::select! {
-                installed = installer::install(&connection) => installed,
-                _ = self.until_disconnect() => {
-                    connection.close().await;
-                    self.status(Status::Disconnected, None);
-                    return;
-                }
-            };
-            let command = match installed {
-                Ok(installed) => installed.command,
-                Err(error) => {
-                    // The Electron app falls back to a shell script here; that path is not
-                    // ported yet.
-                    let message = format!("Agent unavailable: {error:#}");
-                    self.status(Status::Error, Some(&message));
-                    self.until_disconnect().await;
-                    connection.close().await;
-                    self.status(Status::Disconnected, None);
-                    return;
+            self.published.send_replace(Some(connection.clone()));
+            let end = if fallback.is_some() {
+                // A session that fell back stays on the script, across reconnects too.
+                self.stream_script(&connection, &mut ever_connected).await
+            } else {
+                match self.run_agent(&connection, &mut ever_connected).await {
+                    Ok(end) => end,
+                    Err(reason) => {
+                        self.emit(SessionEvent::Fallback(reason.clone()));
+                        self.status(
+                            Status::Connecting,
+                            Some(&format!(
+                                "Agent unavailable; using script fallback ({reason})"
+                            )),
+                        );
+                        fallback = Some(reason);
+                        self.stream_script(&connection, &mut ever_connected).await
+                    }
                 }
             };
 
-            match self
-                .stream_agent(&connection, &command, &mut ever_connected)
-                .await
-            {
+            match end {
                 StreamEnd::Disconnect => {
-                    connection.close().await;
+                    self.close(&connection).await;
                     self.status(Status::Disconnected, None);
                     return;
                 }
                 StreamEnd::FailedStart(message) => {
-                    self.status(
-                        Status::Error,
-                        Some(&format!("Agent failed to start: {message}")),
-                    );
+                    self.status(Status::Error, Some(&message));
                     self.until_disconnect().await;
-                    connection.close().await;
+                    self.close(&connection).await;
                     self.status(Status::Disconnected, None);
                     return;
                 }
                 StreamEnd::Lost(message) => {
-                    connection.close().await;
+                    self.close(&connection).await;
                     if ever_connected && self.wait_to_reconnect(&message).await {
                         continue;
                     }
@@ -288,6 +342,34 @@ impl Session {
                     return;
                 }
             }
+        }
+    }
+
+    /// Installs the agent and reads its stream. `Err` is why the agent is unavailable on this
+    /// host (it could not be installed, or it sent no hello), for the script fallback.
+    async fn run_agent(
+        &mut self,
+        connection: &Connection,
+        ever_connected: &mut bool,
+    ) -> Result<StreamEnd, String> {
+        self.status(Status::Connecting, Some("Installing metrics agent…"));
+        let installed = tokio::select! {
+            installed = installer::install(connection) => installed,
+            _ = self.until_disconnect() => return Ok(StreamEnd::Disconnect),
+        };
+        let command = match installed {
+            Ok(installed) => installed.command,
+            Err(error) if connection.is_closed() => {
+                return Ok(StreamEnd::Lost(format!("{error:#}")));
+            }
+            Err(error) => return Err(format!("{error:#}")),
+        };
+        match self
+            .stream_agent(connection, &command, ever_connected)
+            .await
+        {
+            StreamEnd::FailedStart(message) => Err(message),
+            end => Ok(end),
         }
     }
 
@@ -397,6 +479,120 @@ impl Session {
         }
     }
 
+    /// The script fallback: one exec runs [`script::SCRIPT`], which prints a sample a second,
+    /// started again [`SCRIPT_RESTART`] after it stops while the connection holds. The session
+    /// reports connected on the first sample, and again on the first one after an error.
+    async fn stream_script(
+        &mut self,
+        connection: &Arc<Connection>,
+        ever_connected: &mut bool,
+    ) -> StreamEnd {
+        let command = script::command();
+        let mut delta: Option<DeltaState> = None;
+        let mut snapshot = Snapshot::default();
+        loop {
+            let started = match connection.open_channel().await {
+                Ok(channel) => match channel.exec(true, command.as_str()).await {
+                    Ok(()) => Ok(channel),
+                    Err(error) => Err(error.to_string()),
+                },
+                Err(error) => Err(error.to_string()),
+            };
+            let failure = match started {
+                Err(message) => message,
+                Ok(channel) => {
+                    let (mut reader, writer) = channel.split();
+                    let mut frames = FrameBuffer::default();
+                    let mut live = false;
+                    loop {
+                        tokio::select! {
+                            message = reader.wait() => {
+                                let Some(message) = message else {
+                                    break "Metrics script stopped".to_string();
+                                };
+                                let russh::ChannelMsg::Data { data } = message else {
+                                    continue;
+                                };
+                                for frame in frames.push(&data) {
+                                    let sample =
+                                        parsers::build_metrics(&frame, delta.as_ref(), unix_ms());
+                                    if !sample.supported {
+                                        let _ = writer.close().await;
+                                        return StreamEnd::FailedStart(
+                                            "Script fallback needs a Linux host with /proc".into(),
+                                        );
+                                    }
+                                    delta = Some(sample.state);
+                                    snapshot = snapshot.next(sample.metrics);
+                                    if !live {
+                                        live = true;
+                                        *ever_connected = true;
+                                        self.status(Status::Connected, None);
+                                    }
+                                    self.emit(SessionEvent::Metrics(Box::new(snapshot.clone())));
+                                }
+                            }
+                            command = self.commands.recv() => {
+                                if let Some(end) = self.script_command(connection, command) {
+                                    let _ = writer.close().await;
+                                    return end;
+                                }
+                            }
+                        }
+                    }
+                }
+            };
+            if connection.is_closed() {
+                return StreamEnd::Lost("Connection closed".into());
+            }
+            self.status(Status::Error, Some(&failure));
+            let restart = tokio::time::sleep(SCRIPT_RESTART);
+            tokio::pin!(restart);
+            loop {
+                tokio::select! {
+                    _ = &mut restart => break,
+                    command = self.commands.recv() => {
+                        if let Some(end) = self.script_command(connection, command) {
+                            return end;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// A command while the script fallback runs; `Some` ends the stream. A kill runs as its
+    /// own `kill` exec (the Electron app's `SshSession.killProcess`) and answers as the
+    /// agent's `kill_result` does.
+    fn script_command(
+        &self,
+        connection: &Arc<Connection>,
+        command: Option<SessionCommand>,
+    ) -> Option<StreamEnd> {
+        let (pid, signal, id) = match command {
+            None | Some(SessionCommand::Disconnect) => return Some(StreamEnd::Disconnect),
+            Some(SessionCommand::Kill { pid, signal, id }) => (pid, signal, id),
+            Some(_) => return None,
+        };
+        let (connection, events) = (connection.clone(), self.events.clone());
+        runtime().spawn(async move {
+            let error = match script::kill_command(pid, signal) {
+                None => Some("Invalid pid".to_string()),
+                Some(command) => match connection.exec_capture(&command).await {
+                    Ok(done) if done.code == 0 => None,
+                    Ok(done) => Some(format!("kill exited with {}", done.code)),
+                    Err(error) => Some(error.to_string()),
+                },
+            };
+            let _ = events.unbounded_send(SessionEvent::KillResult {
+                id,
+                ok: error.is_none(),
+                error,
+            });
+        });
+        None
+    }
+
     /// Waits before the next stream, reporting an error after a few failures in a row.
     async fn backoff(&mut self, failures: u32, message: &str) -> Option<StreamEnd> {
         if failures >= FAILURES_BEFORE_ERROR {
@@ -462,4 +658,11 @@ impl Session {
             }
         }
     }
+}
+
+/// Now, in Unix milliseconds: when a script sample arrived.
+fn unix_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |since| since.as_millis() as u64)
 }

@@ -27,14 +27,14 @@ jobs:
 
   agent:
     runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: agent
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: dtolnay/rust-toolchain@stable
         with:
-          go-version-file: agent/go.mod
-      - run: go vet ./...
-      - run: go test ./...
-      - run: bash build.sh
+          targets: x86_64-unknown-linux-musl,aarch64-unknown-linux-musl,x86_64-pc-windows-gnu,aarch64-pc-windows-gnullvm
+      - uses: Swatinem/rust-cache@v2
+      - uses: mlugg/setup-zig@v2
+      - run: cargo install cargo-zigbuild --locked
+      - run: cargo test -p vitals-agent
+      # Linux and Windows here; the macOS agents build on a Mac (app/bundle.sh).
+      - run: bash agent/build.sh

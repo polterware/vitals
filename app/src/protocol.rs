@@ -128,7 +128,7 @@ pub struct Metrics {
     pub gpus: Option<Vec<Gpu>>,
 }
 
-/// Go writes an empty slice as `null`.
+/// The Go agent, still on hosts that have not updated, writes an empty slice as `null`.
 fn nullable<'de, D, T>(deserializer: D) -> Result<T, D::Error>
 where
     D: serde::Deserializer<'de>,
