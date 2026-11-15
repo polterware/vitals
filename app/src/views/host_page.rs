@@ -134,7 +134,21 @@ pub fn host_page(
         window,
         cx,
     );
-    page_content(scroll_id(id), bar, GRID_PAD, content, window, cx)
+    // `page_content` fills a flex column: as the main surface's direct child it would grow to
+    // the dashboard's height and never scroll.
+    div()
+        .size_full()
+        .flex()
+        .flex_col()
+        .child(page_content(
+            scroll_id(id),
+            bar,
+            GRID_PAD,
+            content,
+            window,
+            cx,
+        ))
+        .into_any_element()
 }
 
 /// The dashboard grid of session `id`.
