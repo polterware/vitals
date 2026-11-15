@@ -47,4 +47,10 @@ cat > "$app/Contents/Info.plist" <<PLIST
 PLIST
 
 codesign --force --deep --sign - "$app" >/dev/null 2>&1 || echo "codesign failed; the bundle is unsigned" >&2
+
+# The bundle is rebuilt in place, so tell Launch Services it changed: otherwise the Dock and
+# Finder keep the icon they cached while the old bundle was gone, the blank placeholder.
+touch "$app"
+/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister \
+  -f "$app" >/dev/null 2>&1 || true
 echo "$app"
