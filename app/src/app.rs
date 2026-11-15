@@ -33,6 +33,11 @@ actions!(vitals_app, [Quit, CloseWindow, ConnectHost, OpenSettings]);
 /// title bar's.
 const FRAME_PAD: f32 = 8.0;
 
+/// Where the shared menu draws among the deferred layers: over the modal layer (100 in
+/// polterware-ui), so a select inside the Connect or Settings dialog opens above its scrim,
+/// and under the toasts (110).
+const MENU_PRIORITY: usize = 105;
+
 pub fn register_key_bindings(cx: &mut App) {
     cx.on_action(|_: &Quit, cx| cx.quit());
     cx.bind_keys([
@@ -461,7 +466,7 @@ impl Render for AppView {
             root = root.child(modal);
         }
         root.child(toast_stack(&toasts, dismiss, cx))
-            // Last, so it draws over the page and its cards.
-            .child(deferred(self.menu.clone()).with_priority(1))
+            // Last, so it draws over the page, its cards, and the dialogs.
+            .child(deferred(self.menu.clone()).with_priority(MENU_PRIORITY))
     }
 }
