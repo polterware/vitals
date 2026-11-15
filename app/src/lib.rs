@@ -32,36 +32,43 @@ const DOCK_ICON: &[u8] = include_bytes!("../resources/vitals-icon.png");
 
 /// Opens the Vitals window and runs the app until it quits.
 pub fn run() {
-    Application::new()
-        .with_assets(IconAssets)
-        .run(|cx: &mut App| {
-            cx.activate(true);
-            dock_icon::install_unbundled(DOCK_ICON);
-            theme::set_root_rem(REM);
-            cx.set_global(Theme::dark());
-            polterware_ui::init(cx);
-            register_key_bindings(cx);
-            cx.set_menus(vec![Menu {
-                name: "Vitals".into(),
-                items: vec![MenuItem::action("Quit", Quit)],
-            }]);
-            cx.on_window_closed(|cx| {
-                if cx.windows().is_empty() {
-                    cx.quit();
-                }
-            })
-            .detach();
+    let app = Application::new().with_assets(IconAssets);
+    // A click on the Dock icon brings back the window that closing hid.
+    app.on_reopen(|cx| cx.activate(true));
+    app.run(|cx: &mut App| {
+        cx.activate(true);
+        dock_icon::install_unbundled(DOCK_ICON);
+        theme::set_root_rem(REM);
+        cx.set_global(Theme::dark());
+        polterware_ui::init(cx);
+        register_key_bindings(cx);
+        cx.set_menus(vec![Menu {
+            name: "Vitals".into(),
+            items: vec![MenuItem::action("Quit", Quit)],
+        }]);
+        cx.on_window_closed(|cx| {
+            if cx.windows().is_empty() {
+                cx.quit();
+            }
+        })
+        .detach();
 
-            let options = polterware_ui::window::window_options(
-                "Vitals",
-                size(px(1200.0), px(800.0)),
-                size(px(800.0), px(560.0)),
-                cx,
-            );
-            cx.open_window(options, |window, cx| {
-                vibrancy::install(window);
-                cx.new(|cx| app::AppView::new(window, cx))
-            })
-            .expect("failed to open GPUI window");
-        });
+        let options = polterware_ui::window::window_options(
+            "Vitals",
+            size(px(1200.0), px(800.0)),
+            size(px(800.0), px(560.0)),
+            cx,
+        );
+        cx.open_window(options, |window, cx| {
+            vibrancy::install(window);
+            // The close button hides the app instead of closing its one window, so the
+            // window and its sessions stay as they were until the app quits.
+            window.on_window_should_close(cx, |_, cx| {
+                cx.hide();
+                false
+            });
+            cx.new(|cx| app::AppView::new(window, cx))
+        })
+        .expect("failed to open GPUI window");
+    });
 }

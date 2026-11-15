@@ -431,7 +431,9 @@ impl Render for AppView {
             .text_color(theme.color_text_primary)
             .font_family(theme.font_sans)
             .text_size(px(theme.font_size_md))
-            .on_action(cx.listener(|_, _: &CloseWindow, window, _| window.remove_window()))
+            // As a Mac app does, closing the window hides the app: it stays in the Dock with
+            // the window as it was, and Quit (⌘Q) is what ends it.
+            .on_action(cx.listener(|_, _: &CloseWindow, _, cx| cx.hide()))
             .on_action(cx.listener(|this, _: &ConnectHost, _, cx| {
                 this.state.update(cx, |state, cx| {
                     state.open_connect(None);

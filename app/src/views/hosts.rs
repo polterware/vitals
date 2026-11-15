@@ -8,7 +8,7 @@ use gpui::{AnyElement, App, Entity, IntoElement, SharedString, Window};
 use polterware_ui::button::{Button, ButtonKind};
 use polterware_ui::icons::Icon;
 use polterware_ui::menu::MenuItem;
-use polterware_ui::patterns::{ContextMenu, MascotMood, StartRow, start_page, start_section};
+use polterware_ui::patterns::{ContextMenu, StartRow, start_page, start_section};
 
 use crate::state::{AppState, RECENT_LIMIT};
 use crate::store::Server;
@@ -121,5 +121,5 @@ pub fn hosts_page(
             cx,
         ),
     ];
-    start_page(MascotMood::Sleeping, body, cx)
+    start_page(None, body, cx)
 }
