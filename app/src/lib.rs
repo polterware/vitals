@@ -21,14 +21,16 @@ use app::{Quit, register_key_bindings};
 use gpui::{App, AppContext as _, Application, Menu, MenuItem, px, size};
 use polterware_ui::icons::IconAssets;
 use polterware_ui::theme::{self, Theme};
-use polterware_ui::window::{dock_icon, vibrancy};
+use polterware_ui::window::{app_icon, vibrancy};
 
 /// The design system's root size in the desktop apps.
 const REM: f32 = 13.0;
 
-/// The Dock icon of a build run without its bundle: the Default export of `resources/vitals.icon`
-/// (`vitals Exports`) on the macOS icon grid. The bundle compiles `vitals.icon` itself.
-const DOCK_ICON: &[u8] = include_bytes!("../resources/vitals-icon.png");
+/// Applies the chosen app icon variant (or resets a bundled app back to its compiled icon when
+/// `Default` is selected, falling back to the default PNG when unbundled).
+pub(crate) fn apply_app_icon(icon: settings::AppIcon) {
+    app_icon::apply(icon.override_png(), settings::AppIcon::Default.png());
+}
 
 /// Opens the Vitals window and runs the app until it quits.
 pub fn run() {
@@ -37,7 +39,8 @@ pub fn run() {
     app.on_reopen(|cx| cx.activate(true));
     app.run(|cx: &mut App| {
         cx.activate(true);
-        dock_icon::install_unbundled(DOCK_ICON);
+        let (settings, _) = settings::load(&store::data_dir());
+        apply_app_icon(settings.app_icon);
         theme::set_root_rem(REM);
         cx.set_global(Theme::dark());
         polterware_ui::init(cx);

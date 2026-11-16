@@ -29,9 +29,11 @@ The app looks for the agent binaries in `VITALS_AGENT_DIR`, then the app bundle'
 
 `bash app/bundle.sh` builds `target/bundle/Vitals.app`: the release binary, the agents in
 `Resources/agent`, the Info.plist, and the icon compiled from `app/resources/vitals.icon`
-(Icon Composer, into `Assets.car` and `vitals.icns`), signed ad hoc for this Mac. A build run
-with `cargo run` has no bundle, so it sets its Dock icon from `app/resources/vitals-icon.png`,
-the Default export (`app/resources/vitals Exports`) on the macOS icon grid.
+(Icon Composer, into `Assets.car` and `vitals.icns`), signed ad hoc for this Mac. At
+runtime, the app applies the chosen icon variant (Default, Ice, or Fire, rendered on the
+macOS icon grid as `app/resources/vitals-icon.png`, `vitals-ice-icon.png`, and
+`vitals-fire-icon.png` from their `.icon` bundles); Default uses the compiled `vitals.icon`
+in a bundle and falls back to `vitals-icon.png` when run unbundled via `cargo run`.
 
 Saved hosts and approved host keys live in `~/Library/Application Support/Vitals`
 (`servers.json`, `known_hosts.json`), the files the Electron app wrote, so both read the
@@ -103,8 +105,8 @@ This app replaces the Electron app `apps/vitals-desktop` of the former Polterwar
   and says when the shell ends. The terminal is polterware-ui's `TerminalView`.
 - Stopping a process, with its confirmation and default signal, and the close-session
   confirmation.
-- Settings, section for section, with its search: General (reduce transparency, network
-  unit), Monitoring (history window, kill confirmation and signal), Connections (close
+- Settings, section for section, with its search: General (reduce transparency, app icon,
+  network unit), Monitoring (history window, kill confirmation and signal), Connections (close
   confirmation, auto-reconnect and its delay, known hosts), and Advanced (reset the card
   layout, clear the recent hosts). They save to `settings.json`.
 - The connect dialog (`ConnectionDialog`), with Save server. It stays open while the host

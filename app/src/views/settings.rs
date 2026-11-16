@@ -1,9 +1,10 @@
 //! Settings (the Electron app's `SettingsDialog`), section for section and row for row:
-//! General (Appearance: reduce transparency; Units: the network unit), Monitoring (Charts: the
-//! history window; Processes: the kill confirmation and its signal), Connections (Sessions:
-//! the close confirmation; Reconnect: reconnecting and its delay; Known hosts), and Advanced
-//! (Layout: reset the cards; History: clear the recent hosts). Each change saves at once. The
-//! rail's search finds a setting by its words (`SEARCH_ENTRIES`) and opens its section.
+//! General (Appearance: reduce transparency, app icon; Units: the network unit), Monitoring
+//! (Charts: the history window; Processes: the kill confirmation and its signal), Connections
+//! (Sessions: the close confirmation; Reconnect: reconnecting and its delay; Known hosts), and
+//! Advanced (Layout: reset the cards; History: clear the recent hosts). Each change saves at
+//! once. The rail's search finds a setting by its words (`SEARCH_ENTRIES`) and opens its
+//! section.
 
 use std::rc::Rc;
 
@@ -14,6 +15,7 @@ use gpui::{
 use polterware_ui::button::{Button, ButtonKind};
 use polterware_ui::data_table::{Column, DataTable, sans, table_height};
 use polterware_ui::ellipsis::fade;
+use polterware_ui::icon_choice::IconChoice;
 use polterware_ui::icons::Icon;
 use polterware_ui::menu::MenuItem;
 use polterware_ui::patterns::{
@@ -26,7 +28,7 @@ use polterware_ui::text_input::{FieldSize, TextInput};
 use polterware_ui::theme::{Theme, rem};
 
 use crate::protocol::Signal;
-use crate::settings::{HISTORY_WINDOWS, NetworkUnit, RECONNECT_DELAY, Settings};
+use crate::settings::{AppIcon, HISTORY_WINDOWS, NetworkUnit, RECONNECT_DELAY, Settings};
 use crate::state::{AppState, SettingsSection};
 
 /// `w-48`.
@@ -50,6 +52,9 @@ fn search_entries() -> Vec<SettingsSearchEntry> {
         entry("general", "Appearance", "Reduce transparency")
             .description("Solid window chrome instead of the frosted glass.")
             .keywords("glass vibrancy blur translucent opaque"),
+        entry("general", "Appearance", "App icon")
+            .description("Choose the icon shown in the Dock and Finder.")
+            .keywords("dock finder variant default ice fire"),
         entry("general", "Units", "Network unit")
             .description("Bytes or bits per second.")
             .keywords("bandwidth rate bits bytes"),
@@ -182,6 +187,7 @@ impl SettingsView {
                     });
                 })
         });
+        cx.observe(&state, |_, _, cx| cx.notify()).detach();
         cx.observe(&search, |_, _, cx| cx.notify()).detach();
         Self {
             state,
@@ -285,6 +291,22 @@ impl SettingsView {
     }
 
     fn general(&self, settings: &Settings, cx: &App) -> AnyElement {
+        let mut app_icon = IconChoice::new("settings-app-icon")
+            .selected(settings.app_icon.key())
+            .on_change({
+                let state = self.state.clone();
+                move |key, _, cx| {
+                    let picked = AppIcon::from_key(key.as_ref());
+                    state.update(cx, |state, cx| {
+                        state.update_settings(|settings| settings.app_icon = picked);
+                        cx.notify();
+                    });
+                    crate::apply_app_icon(picked);
+                }
+            });
+        for variant in AppIcon::ALL {
+            app_icon = app_icon.option(variant.key(), variant.label(), variant.png());
+        }
         let unit = self.select(
             0,
             "settings-network-unit",
@@ -313,6 +335,11 @@ impl SettingsView {
                     settings_row("Reduce transparency")
                         .description("Use solid window chrome instead of the frosted glass.")
                         .child(self.reduce_transparency.clone()),
+                )
+                .child(
+                    settings_row("App icon")
+                        .description("Choose the icon shown in the Dock and Finder.")
+                        .child(app_icon),
                 )
                 .into_any_element(),
             settings_group("Units")
@@ -588,5 +615,76 @@ impl Render for SettingsView {
                 });
             }))
             .child(content)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use gpui::{
+        AppContext as _, Bounds, TestAppContext, VisualTestContext, WindowBounds, WindowOptions,
+        point, px, size,
+    };
+    use polterware_ui::patterns::search_settings;
+
+    use super::*;
+
+    #[test]
+    fn search_entries_index_app_icon() {
+        let entries = search_entries();
+        for query in ["app icon", "ice", "fire", "dock"] {
+            let hits = search_settings(&entries, query);
+            assert!(
+                hits.iter().any(|entry| {
+                    entry.item == "general"
+                        && entry.section.as_ref().is_some_and(|s| s == "Appearance")
+                        && entry.label == "App icon"
+                }),
+                "query {query:?} should match App icon"
+            );
+        }
+    }
+
+    #[gpui::test]
+    fn general_appearance_draws_app_icon_choice(cx: &mut TestAppContext) {
+        let state = cx.new(|_| AppState::new());
+        let root = state.clone();
+        let window = cx.update(|cx| {
+            polterware_ui::init(cx);
+            let bounds = Bounds::new(point(px(0.0), px(0.0)), size(px(960.0), px(800.0)));
+            cx.open_window(
+                WindowOptions {
+                    window_bounds: Some(WindowBounds::Windowed(bounds)),
+                    ..Default::default()
+                },
+                move |_, cx| {
+                    let menu = cx.new(ContextMenu::new);
+                    cx.new(|cx| SettingsView::new(root, menu, cx))
+                },
+            )
+            .expect("the test window opens")
+        });
+        let mut cx = VisualTestContext::from_window(window.into(), cx);
+        cx.update(|window, _| window.activate_window());
+        state.update(&mut cx, |state, cx| {
+            state.open_settings(SettingsSection::General);
+            cx.notify();
+        });
+        cx.update(|window, cx| {
+            window.refresh();
+            window.draw(cx).clear();
+        });
+        cx.run_until_parked();
+
+        let default = cx
+            .debug_bounds("settings-app-icon-default")
+            .expect("Default icon option draws");
+        let ice = cx
+            .debug_bounds("settings-app-icon-ice")
+            .expect("Ice icon option draws");
+        let fire = cx
+            .debug_bounds("settings-app-icon-fire")
+            .expect("Fire icon option draws");
+        assert!(ice.left() > default.right());
+        assert!(fire.left() > ice.right());
     }
 }

@@ -10,6 +10,65 @@ use serde_json::{Map, Value, json};
 use crate::protocol::Signal;
 use crate::session::Reconnect;
 
+const DEFAULT_ICON: &[u8] = include_bytes!("../resources/vitals-icon.png");
+const ICE_ICON: &[u8] = include_bytes!("../resources/vitals-ice-icon.png");
+const FIRE_ICON: &[u8] = include_bytes!("../resources/vitals-fire-icon.png");
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum AppIcon {
+    #[default]
+    Default,
+    Ice,
+    Fire,
+}
+
+impl AppIcon {
+    pub const ALL: [Self; 3] = [Self::Default, Self::Ice, Self::Fire];
+
+    pub fn from_key(key: &str) -> Self {
+        match key {
+            "ice" => Self::Ice,
+            "fire" => Self::Fire,
+            _ => Self::Default,
+        }
+    }
+
+    pub fn key(self) -> &'static str {
+        match self {
+            Self::Default => "default",
+            Self::Ice => "ice",
+            Self::Fire => "fire",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Default => "Default",
+            Self::Ice => "Ice",
+            Self::Fire => "Fire",
+        }
+    }
+
+    /// PNG bytes rendered on the macOS icon grid for this variant.
+    pub fn png(self) -> &'static [u8] {
+        match self {
+            Self::Default => DEFAULT_ICON,
+            Self::Ice => ICE_ICON,
+            Self::Fire => FIRE_ICON,
+        }
+    }
+
+    /// `None` for Default (restores the bundle's compiled icon, or falls back to the default PNG
+    /// when unbundled); `Some(png)` for an icon variant override.
+    pub fn override_png(self) -> Option<&'static [u8]> {
+        match self {
+            Self::Default => None,
+            Self::Ice => Some(ICE_ICON),
+            Self::Fire => Some(FIRE_ICON),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NetworkUnit {
     Bytes,
@@ -20,6 +79,7 @@ pub enum NetworkUnit {
 pub struct Settings {
     /// Opaque window chrome instead of the frosted glass.
     pub reduce_transparency: bool,
+    pub app_icon: AppIcon,
     pub network_unit: NetworkUnit,
     /// 2, 5, or 10.
     pub history_window_minutes: u32,
@@ -38,6 +98,7 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             reduce_transparency: false,
+            app_icon: AppIcon::Default,
             network_unit: NetworkUnit::Bytes,
             history_window_minutes: 2,
             confirm_before_kill: true,
@@ -59,6 +120,9 @@ impl Settings {
         let flag = |key: &str| object.get(key).and_then(Value::as_bool);
         if let Some(on) = flag("reduceTransparency") {
             settings.reduce_transparency = on;
+        }
+        if let Some(key) = object.get("appIcon").and_then(Value::as_str) {
+            settings.app_icon = AppIcon::from_key(key);
         }
         match object.get("networkUnit").and_then(Value::as_str) {
             Some("bytes") => settings.network_unit = NetworkUnit::Bytes,
@@ -106,6 +170,7 @@ impl Settings {
         let mut object = base.as_object().cloned().unwrap_or_else(Map::new);
         let fields = json!({
             "reduceTransparency": self.reduce_transparency,
+            "appIcon": self.app_icon.key(),
             "networkUnit": match self.network_unit {
                 NetworkUnit::Bytes => "bytes",
                 NetworkUnit::Bits => "bits",
@@ -189,18 +254,22 @@ mod tests {
         });
         let settings = Settings::from_value(&raw);
         assert!(settings.reduce_transparency);
+        assert_eq!(settings.app_icon, AppIcon::Default);
         assert_eq!(settings.network_unit, NetworkUnit::Bits);
         assert_eq!(settings.history_samples(), 600);
         assert!(!settings.confirm_before_kill && !settings.confirm_before_close_session);
         assert_eq!(settings.default_kill_signal, Signal::Kill);
         assert!(!settings.reconnect().enabled);
         assert_eq!(settings.reconnect().delay, Duration::from_secs(30));
-        assert_eq!(settings.to_value(&raw), raw);
+        let mut expected = raw.clone();
+        expected["appIcon"] = json!("default");
+        assert_eq!(settings.to_value(&raw), expected);
     }
 
     #[test]
     fn bad_values_fall_back() {
         let raw = json!({
+            "appIcon": "lava",
             "networkUnit": "octets",
             "historyWindowMinutes": 3,
             "defaultKillSignal": "HUP",
@@ -208,6 +277,10 @@ mod tests {
             "autoReconnect": "yes"
         });
         assert_eq!(Settings::from_value(&raw), Settings::default());
+        assert_eq!(
+            Settings::from_value(&json!({ "appIcon": 42 })),
+            Settings::default()
+        );
         assert_eq!(Settings::from_value(&json!([1])), Settings::default());
     }
 
@@ -226,5 +299,64 @@ mod tests {
         assert_eq!(raw["theme"], "light");
         assert_eq!(raw["later"], 1);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn app_icon_round_trips_and_falls_back_to_default() {
+        let dir = std::env::temp_dir().join(format!("vitals-settings-icon-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        for (variant, expected_key) in [
+            (AppIcon::Default, "default"),
+            (AppIcon::Ice, "ice"),
+            (AppIcon::Fire, "fire"),
+        ] {
+            let settings = Settings {
+                app_icon: variant,
+                ..Settings::default()
+            };
+            let written = save(&dir, &settings, &Value::Null).unwrap();
+            assert_eq!(written["appIcon"], expected_key);
+            let (read, _) = load(&dir);
+            assert_eq!(read.app_icon, variant);
+        }
+        assert_eq!(Settings::from_value(&json!({})).app_icon, AppIcon::Default);
+        assert_eq!(
+            Settings::from_value(&json!({ "appIcon": "unknown" })).app_icon,
+            AppIcon::Default
+        );
+        assert_eq!(
+            Settings::from_value(&json!({ "appIcon": null })).app_icon,
+            AppIcon::Default
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn app_icon_key_maps_to_png_and_override() {
+        const PNG_HEADER: &[u8] = &[137, 80, 78, 71, 13, 10, 26, 10];
+        assert_eq!(AppIcon::from_key("default"), AppIcon::Default);
+        assert_eq!(AppIcon::from_key("ice"), AppIcon::Ice);
+        assert_eq!(AppIcon::from_key("fire"), AppIcon::Fire);
+        assert_eq!(AppIcon::from_key("other"), AppIcon::Default);
+        assert_eq!(AppIcon::from_key(""), AppIcon::Default);
+
+        assert_eq!(AppIcon::Default.key(), "default");
+        assert_eq!(AppIcon::Ice.key(), "ice");
+        assert_eq!(AppIcon::Fire.key(), "fire");
+        assert_eq!(AppIcon::Default.label(), "Default");
+        assert_eq!(AppIcon::Ice.label(), "Ice");
+        assert_eq!(AppIcon::Fire.label(), "Fire");
+
+        for variant in AppIcon::ALL {
+            let png = AppIcon::from_key(variant.key()).png();
+            assert!(png.starts_with(PNG_HEADER));
+        }
+        assert_ne!(AppIcon::Default.png(), AppIcon::Ice.png());
+        assert_ne!(AppIcon::Default.png(), AppIcon::Fire.png());
+        assert_ne!(AppIcon::Ice.png(), AppIcon::Fire.png());
+
+        assert_eq!(AppIcon::Default.override_png(), None);
+        assert_eq!(AppIcon::Ice.override_png(), Some(AppIcon::Ice.png()));
+        assert_eq!(AppIcon::Fire.override_png(), Some(AppIcon::Fire.png()));
     }
 }
